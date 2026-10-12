@@ -1,0 +1,495 @@
+export interface CompanySuggestion {
+  symbol: string;
+  name: string;
+  cik: string;
+}
+
+export type TransactionType =
+  | "purchase"
+  | "sale"
+  | "award"
+  | "conversion"
+  | "other";
+
+export interface InsiderTransaction {
+  id: string;
+  accession: string;
+  filingDate: string;
+  transactionDate: string;
+  insiderName: string;
+  title: string;
+  role: string;
+  transactionType: TransactionType;
+  code: string;
+  shares: number;
+  pricePerShare: number | null;
+  value: number | null;
+  sharesOwnedFollowing: number | null;
+  directOrIndirect: string;
+  filingUrl: string;
+}
+
+interface SecCompanyRecord {
+  cik_str: number;
+  ticker: string;
+  title: string;
+}
+
+interface SecSubmissions {
+  name: string;
+  filings?: {
+    recent?: {
+      form?: string[];
+      filingDate?: string[];
+      accessionNumber?: string[];
+      primaryDocument?: string[];
+    };
+  };
+}
+
+interface CacheEntry<T> {
+  expiresAt: number;
+  value: T;
+}
+
+const SEC_COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json";
+const SEC_CACHE_TTL_MS = 15 * 60 * 1000;
+const COMPANY_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const companyCache = new Map<string, CacheEntry<CompanySuggestion[]>>();
+const submissionsCache = new Map<string, CacheEntry<SecSubmissions>>();
+const filingCache = new Map<string, CacheEntry<string>>();
+
+function secHeaders(accept: string): Record<string, string> {
+  return {
+    Accept: accept,
+    "User-Agent":
+      process.env.SEC_USER_AGENT ??
+      "Insider Activity Timeline Analyzer/1.0 (public SEC filing research tool)",
+  };
+}
+
+async function fetchSecText(url: string, accept: string): Promise<string> {
+  const response = await fetch(url, {
+    headers: secHeaders(accept),
+    signal: AbortSignal.timeout(20_000),
+  });
+
+  if (!response.ok) {
+    throw new Error(`SEC returned ${response.status} for a filing request`);
+  }
+
+  const text = await response.text();
+  if (
+    /<!doctype html|<html\b|undeclared automated tool/i.test(
+      text.slice(0, 2_000),
+    )
+  ) {
+    throw new Error(
+      "SEC blocked the filing download because its automated request identity is incomplete.",
+    );
+  }
+  return text;
+}
+
+async function fetchSecJson<T>(url: string): Promise<T> {
+  const text = await fetchSecText(url, "application/json");
+  return JSON.parse(text) as T;
+}
+
+function isFresh<T>(entry: CacheEntry<T> | undefined): entry is CacheEntry<T> {
+  return Boolean(entry && entry.expiresAt > Date.now());
+}
+
+async function loadCompanies(): Promise<CompanySuggestion[]> {
+  const cached = companyCache.get("all");
+  if (isFresh(cached)) {
+    return cached.value;
+  }
+
+  const response = await fetchSecJson<Record<string, SecCompanyRecord>>(
+    SEC_COMPANY_TICKERS_URL,
+  );
+  const companies = Object.values(response)
+    .filter(
+      (record) =>
+        typeof record.ticker === "string" &&
+        typeof record.title === "string" &&
+        Number.isInteger(record.cik_str),
+    )
+    .map((record) => ({
+      symbol: record.ticker.toUpperCase(),
+      name: record.title,
+      cik: String(record.cik_str).padStart(10, "0"),
+    }));
+
+  companyCache.set("all", {
+    value: companies,
+    expiresAt: Date.now() + COMPANY_CACHE_TTL_MS,
+  });
+  return companies;
+}
+
+export async function searchCompanies(query: string): Promise<CompanySuggestion[]> {
+  const normalized = query.trim().toUpperCase();
+  const companies = await loadCompanies();
+
+  return companies
+    .filter(
+      (company) =>
+        company.symbol.startsWith(normalized) ||
+        company.name.toUpperCase().includes(normalized),
+    )
+    .sort((a, b) => {
+      const aExact = a.symbol === normalized ? 0 : 1;
+      const bExact = b.symbol === normalized ? 0 : 1;
+      if (aExact !== bExact) return aExact - bExact;
+      const aPrefix = a.symbol.startsWith(normalized) ? 0 : 1;
+      const bPrefix = b.symbol.startsWith(normalized) ? 0 : 1;
+      if (aPrefix !== bPrefix) return aPrefix - bPrefix;
+      return a.symbol.localeCompare(b.symbol);
+    })
+    .slice(0, 12);
+}
+
+async function getCompanyBySymbol(symbol: string): Promise<CompanySuggestion | null> {
+  const companies = await loadCompanies();
+  return companies.find((company) => company.symbol === symbol) ?? null;
+}
+
+async function loadSubmissions(company: CompanySuggestion): Promise<SecSubmissions> {
+  const cached = submissionsCache.get(company.cik);
+  if (isFresh(cached)) {
+    return cached.value;
+  }
+
+  const submissions = await fetchSecJson<SecSubmissions>(
+    `https://data.sec.gov/submissions/CIK${company.cik}.json`,
+  );
+  submissionsCache.set(company.cik, {
+    value: submissions,
+    expiresAt: Date.now() + SEC_CACHE_TTL_MS,
+  });
+  return submissions;
+}
+
+function xmlDecode(value: string): string {
+  return value
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_match, code: string) =>
+      String.fromCodePoint(Number(code)),
+    )
+    .replace(/&#x([\da-f]+);/gi, (_match, code: string) =>
+      String.fromCodePoint(parseInt(code, 16)),
+    );
+}
+
+function getTagValue(xml: string, tag: string): string {
+  return xmlDecode(getTagInner(xml, tag).replace(/<[^>]+>/g, "").trim());
+}
+
+function getTagInner(xml: string, tag: string): string {
+  const escaped = tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = xml.match(
+    new RegExp(`<${escaped}(?:\\s[^>]*)?>([\\s\\S]*?)</${escaped}\\s*>`, "i"),
+  );
+  if (!match) return "";
+  return match[1];
+}
+
+function getTagBlocks(xml: string, tag: string): string[] {
+  const escaped = tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const matches = xml.matchAll(
+    new RegExp(`<${escaped}(?:\\s[^>]*)?>([\\s\\S]*?)</${escaped}\\s*>`, "gi"),
+  );
+  return Array.from(matches, (match) => match[1]);
+}
+
+function nestedValue(xml: string, tag: string): string {
+  return getTagValue(getTagInner(xml, tag), "value");
+}
+
+function numericValue(value: string): number | null {
+  if (!value) return null;
+  const number = Number(value.replace(/,/g, ""));
+  return Number.isFinite(number) ? number : null;
+}
+
+function isTruthyXml(value: string): boolean {
+  return value === "1" || value.toLowerCase() === "true";
+}
+
+function transactionTypeForCode(code: string): TransactionType {
+  switch (code.toUpperCase()) {
+    case "P":
+      return "purchase";
+    case "S":
+      return "sale";
+    case "A":
+      return "award";
+    case "M":
+    case "C":
+      return "conversion";
+    default:
+      return "other";
+  }
+}
+
+function roleForOwner(owner: string): { title: string; role: string } {
+  const relationship = getTagInner(owner, "reportingOwnerRelationship");
+  const officerTitle = getTagValue(relationship, "officerTitle");
+  const roles: string[] = [];
+
+  if (isTruthyXml(getTagValue(relationship, "isOfficer"))) {
+    roles.push("Officer");
+  }
+  if (isTruthyXml(getTagValue(relationship, "isDirector"))) {
+    roles.push("Director");
+  }
+  if (isTruthyXml(getTagValue(relationship, "isTenPercentOwner"))) {
+    roles.push("10% Owner");
+  }
+  if (isTruthyXml(getTagValue(relationship, "isOther"))) {
+    roles.push("Other");
+  }
+
+  return {
+    title: officerTitle || roles[0] || "Insider",
+    role: roles.length > 0 ? roles.join(" · ") : "Insider",
+  };
+}
+
+function parseOwnerTransactions(
+  xml: string,
+  filing: { accession: string; filingDate: string; cik: string; document: string },
+): InsiderTransaction[] {
+  const owners = getTagBlocks(xml, "reportingOwner");
+  const ownerDetails =
+    owners.length > 0
+      ? owners.map((owner) => ({
+          name: getTagValue(owner, "rptOwnerName"),
+          ...roleForOwner(owner),
+        }))
+      : [{ name: "", title: "Insider", role: "Insider" }];
+
+  const blocks = [
+    ...getTagBlocks(xml, "nonDerivativeTransaction"),
+    ...getTagBlocks(xml, "derivativeTransaction"),
+  ];
+  const documentPath = filing.document
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+  const filingUrl = `https://www.sec.gov/Archives/edgar/data/${filing.cik.replace(/^0+/, "")}/${filing.accession.replaceAll("-", "")}/${documentPath}`;
+  const transactions: InsiderTransaction[] = [];
+
+  blocks.forEach((block, transactionIndex) => {
+    const transactionDate = nestedValue(block, "transactionDate");
+    const dateIsValid =
+      /^\d{4}-\d{2}-\d{2}$/.test(transactionDate) &&
+      !Number.isNaN(Date.parse(`${transactionDate}T00:00:00Z`));
+    if (!dateIsValid) return;
+
+    const code = getTagValue(getTagInner(block, "transactionCoding"), "transactionCode");
+    const shares = numericValue(nestedValue(block, "transactionShares")) ?? 0;
+    const pricePerShare = numericValue(
+      nestedValue(block, "transactionPricePerShare"),
+    );
+    const value =
+      pricePerShare === null ? null : Math.abs(shares * pricePerShare);
+    const sharesOwnedFollowing = numericValue(
+      nestedValue(block, "sharesOwnedFollowingTransaction"),
+    );
+    const directOrIndirect =
+      getTagValue(
+        getTagInner(block, "ownershipNature"),
+        "directOrIndirectOwnership",
+      ) || "Unknown";
+    const type = transactionTypeForCode(code);
+    const ownersForTransaction = ownerDetails.filter((owner) => owner.name);
+    const matchedOwners = ownersForTransaction.length > 0 ? ownersForTransaction : ownerDetails;
+
+    for (const [ownerIndex, owner] of matchedOwners.entries()) {
+      transactions.push({
+        id: `${filing.accession}-${transactionIndex}-${ownerIndex}`,
+        accession: filing.accession,
+        filingDate: filing.filingDate,
+        transactionDate,
+        insiderName: owner.name || "Reporting owner not listed",
+        title: owner.title,
+        role: owner.role,
+        transactionType: type,
+        code: code || "—",
+        shares,
+        pricePerShare,
+        value,
+        sharesOwnedFollowing,
+        directOrIndirect,
+        filingUrl,
+      });
+    }
+  });
+
+  return transactions;
+}
+
+async function loadFilingXml(
+  filing: { accession: string; cik: string },
+): Promise<string> {
+  const cacheKey = `${filing.accession}.txt`;
+  const cached = filingCache.get(cacheKey);
+  if (isFresh(cached)) return cached.value;
+
+  const url = `https://www.sec.gov/Archives/edgar/data/${filing.cik.replace(/^0+/, "")}/${filing.accession.replaceAll("-", "")}/${filing.accession}.txt`;
+  const xml = await fetchSecText(url, "text/plain, */*");
+  filingCache.set(cacheKey, {
+    value: xml,
+    expiresAt: Date.now() + SEC_CACHE_TTL_MS,
+  });
+  return xml;
+}
+
+async function mapWithConcurrency<T, R>(
+  values: T[],
+  concurrency: number,
+  mapper: (value: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(values.length);
+  let nextIndex = 0;
+
+  async function worker(): Promise<void> {
+    while (nextIndex < values.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await mapper(values[index]);
+    }
+  }
+
+  await Promise.all(
+    Array.from(
+      { length: Math.min(concurrency, values.length) },
+      () => worker(),
+    ),
+  );
+  return results;
+}
+
+export interface InsiderActivity {
+  company: CompanySuggestion;
+  days: number;
+  transactions: InsiderTransaction[];
+  summary: {
+    totalTransactions: number;
+    purchases: number;
+    sales: number;
+    awards: number;
+    netShares: number;
+    netValue: number | null;
+    uniqueInsiders: number;
+    latestFilingDate: string | null;
+  };
+  generatedAt: string;
+  source: string;
+}
+
+export async function getInsiderActivity(
+  symbol: string,
+  days: number,
+  limit: number,
+): Promise<InsiderActivity | null> {
+  const company = await getCompanyBySymbol(symbol);
+  if (!company) return null;
+
+  const submissions = await loadSubmissions(company);
+  const recent = submissions.filings?.recent;
+  const forms = recent?.form ?? [];
+  const filingDates = recent?.filingDate ?? [];
+  const accessions = recent?.accessionNumber ?? [];
+  const documents = recent?.primaryDocument ?? [];
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+
+  const filings = forms
+    .map((form, index) => ({
+      form,
+      filingDate: filingDates[index],
+      accession: accessions[index],
+      document: documents[index],
+    }))
+    .filter(
+      (filing) =>
+        (filing.form === "4" || filing.form === "4/A") &&
+        filing.filingDate &&
+        Date.parse(`${filing.filingDate}T00:00:00Z`) >= cutoff &&
+        filing.accession &&
+        filing.document,
+    )
+    .slice(0, limit)
+    .map((filing) => ({
+      accession: filing.accession,
+      filingDate: filing.filingDate,
+      document: filing.document,
+    }));
+
+  const parsedFilings = await mapWithConcurrency(filings, 4, async (filing) => {
+    const xml = await loadFilingXml({
+      accession: filing.accession,
+      cik: company.cik,
+    });
+    return parseOwnerTransactions(xml, { ...filing, cik: company.cik });
+  });
+  const transactions = parsedFilings
+    .flat()
+    .sort((a, b) => {
+      const filingOrder = b.filingDate.localeCompare(a.filingDate);
+      if (filingOrder !== 0) return filingOrder;
+      return b.transactionDate.localeCompare(a.transactionDate);
+    });
+
+  let netShares = 0;
+  let netValue = 0;
+  let hasNetValue = false;
+  const insiders = new Set<string>();
+  for (const transaction of transactions) {
+    insiders.add(transaction.insiderName);
+    if (transaction.transactionType === "purchase") {
+      netShares += Math.abs(transaction.shares);
+    } else if (transaction.transactionType === "sale") {
+      netShares -= Math.abs(transaction.shares);
+    }
+
+    if (transaction.value !== null) {
+      if (transaction.transactionType === "purchase") {
+        netValue += transaction.value;
+        hasNetValue = true;
+      } else if (transaction.transactionType === "sale") {
+        netValue -= transaction.value;
+        hasNetValue = true;
+      }
+    }
+  }
+
+  const filingDatesWithActivity = transactions
+    .map((transaction) => transaction.filingDate)
+    .sort((a, b) => b.localeCompare(a));
+
+  return {
+    company,
+    days,
+    transactions,
+    summary: {
+      totalTransactions: transactions.length,
+      purchases: transactions.filter((item) => item.transactionType === "purchase").length,
+      sales: transactions.filter((item) => item.transactionType === "sale").length,
+      awards: transactions.filter((item) => item.transactionType === "award").length,
+      netShares,
+      netValue: hasNetValue ? Number(netValue.toFixed(2)) : null,
+      uniqueInsiders: insiders.size,
+      latestFilingDate: filingDatesWithActivity[0] ?? null,
+    },
+    generatedAt: new Date().toISOString(),
+    source: "SEC EDGAR Form 4 filings",
+  };
+}
